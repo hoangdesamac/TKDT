@@ -5,7 +5,7 @@ import sys
 import time
 
 
-def check_connection(uart):
+def check_connection(uart, pending_scans=None):
     deadline = time.monotonic() + 8
     next_ping = 0
     while time.monotonic() < deadline:
@@ -15,6 +15,9 @@ def check_connection(uart):
         message = uart.readline().decode("ascii", errors="replace").strip()
         if message:
             print(f"ESP32 -> Pi: {message}", flush=True)
+        scan_id = parse_scan_request(message)
+        if scan_id is not None and pending_scans is not None:
+            pending_scans.append(scan_id)
         if message == "PONG":
             print("UART OK: both transmit and receive work.")
             return True
@@ -22,8 +25,10 @@ def check_connection(uart):
     return False
 
 
-def serve_scans(uart, result):
+def serve_scans(uart, result, pending_scans=None):
     print(f"Test mode: every SCAN returns {result}; no camera is used.", flush=True)
+    for scan_id in pending_scans or ():
+        send_classification(uart, scan_id, result)
     while True:
         message = uart.readline().decode("ascii", errors="replace").strip()
         if not message:
@@ -73,10 +78,11 @@ def main():
             parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
             timeout=0.2, write_timeout=1,
         ) as uart:
-            if not check_connection(uart):
+            pending_scans = []
+            if not check_connection(uart, pending_scans):
                 return 1
             if args.mode == "scan":
-                serve_scans(uart, args.result)
+                serve_scans(uart, args.result, pending_scans)
     except serial.SerialException as error:
         print(f"UART error: {error}", file=sys.stderr)
         return 1

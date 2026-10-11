@@ -7,8 +7,11 @@
 #include <Wire.h>                                       
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 constexpr uint8_t CYD_MAC_ADDRESS[6] = {0xF4, 0x2D, 0xC9, 0x7A, 0x6A, 0xD4};
+#ifndef IR_BELT_TEST_ENABLED
+#define IR_BELT_TEST_ENABLED 1
+#endif
+constexpr bool IR_BELT_TEST_MODE = IR_BELT_TEST_ENABLED != 0;
 constexpr bool SENSOR_STOP_TEST_MODE = false;
-#define BUTTON_PIN 34
 #define RELAY_PIN 26
 
 #define IR1_PIN 32
@@ -94,9 +97,6 @@ void runSensorStopTest() {
     return;
   }
 
-  static int lastButtonReading = HIGH;
-  static int stableButtonState = HIGH;
-  static unsigned long lastButtonChange = 0;
   static uint8_t lastSensorMask = 0xFF;
   static bool lastConveyorRunning = false;
   static unsigned long lastStatusLog = 0;
@@ -114,29 +114,6 @@ void runSensorStopTest() {
     Serial.printf("TEST_IR: IR1=%d IR2=%d (1=blocked)\n",
                   (sensorMask & 1) != 0, (sensorMask & 2) != 0);
     lastSensorMask = sensorMask;
-  }
-
-  int buttonReading = digitalRead(BUTTON_PIN);
-  if (buttonReading != lastButtonReading) {
-    lastButtonChange = millis();
-    lastButtonReading = buttonReading;
-  }
-
-  // Toggle once per debounced press, without pausing sensor checks.
-  if (millis() - lastButtonChange >= 50 &&
-      buttonReading != stableButtonState) {
-    stableButtonState = buttonReading;
-    if (stableButtonState == LOW) {
-      if (isSystemRunning) {
-        isSystemRunning = false;
-        Serial.println("SYSTEM_STOP");
-      } else if (!obstacleDetected) {
-        isSystemRunning = true;
-        Serial.println("SYSTEM_START");
-      } else {
-        Serial.println("TEST_START_BLOCKED: clear IR1 and IR2 first");
-      }
-    }
   }
 
   // Stop the belt before any servo command, then wait for the return motion.
@@ -158,9 +135,9 @@ void runSensorStopTest() {
 
   // Report raw inputs separately from the interpreted obstacle flags.
   if (millis() - lastStatusLog >= 1000) {
-    Serial.printf("TEST_RAW: IR1=%d IR2=%d BUTTON=%d ENABLED=%d RUN=%d "
+    Serial.printf("TEST_RAW: IR1=%d IR2=%d ENABLED=%d RUN=%d "
                   "SERVO_BUSY=%d RELAY_CMD=%d\n",
-                  ir1Raw, ir2Raw, buttonReading, isSystemRunning,
+                  ir1Raw, ir2Raw, isSystemRunning,
                   conveyorRunning, servosBusy, relayCommand);
     lastStatusLog = millis();
   }
@@ -177,7 +154,7 @@ constexpr unsigned long IR_CLEAR_MS = 150;
 
 HardwareSerial PiSerial(2);
 enum class SortingPhase {
-  STOPPED, HOMING, MOVING, SCAN_SETTLING, WAIT_PI, WAIT_IR2,
+  HOMING, MOVING, SCAN_SETTLING, WAIT_PI, WAIT_IR2,
   GATE_SETTLING, GATING, RELEASING, RETURNING, FAULT
 };
 SortingPhase sortingPhase = SortingPhase::HOMING;
@@ -195,7 +172,6 @@ bool piLineOverflow = false;
 
 const char *sortingPhaseName() {
   switch (sortingPhase) {
-  case SortingPhase::STOPPED: return "STOPPED";
   case SortingPhase::HOMING: return "HOMING";
   case SortingPhase::MOVING: return "MOVING";
   case SortingPhase::SCAN_SETTLING: return "SCAN_SETTLING";
@@ -213,10 +189,52 @@ const char *sortingPhaseName() {
 void setSortingPhase(SortingPhase phase) {
   sortingPhase = phase;
   sortingPhaseStarted = millis();
+  Serial.printf("SORT_STATE: %s\n", sortingPhaseName());
 }
 
 void setConveyor(bool running) {
-  digitalWrite(RELAY_PIN, running ? RELAY_ON : RELAY_OFF);
+  static int lastCommand = -1;
+  int command = running ? RELAY_ON : RELAY_OFF;
+  digitalWrite(RELAY_PIN, command);
+  if (command != lastCommand) {
+    Serial.printf("RELAY_CMD: G26=%d REQUEST=%s\n", command, running ? "RUN" : "STOP");
+    lastCommand = command;
+  }
+}
+
+void runIrBeltStopTest() {
+  static int lastIr1 = -1;
+  static int lastIr2 = -1;
+  static unsigned long lastLog = 0;
+  int ir1 = digitalRead(IR1_PIN);
+  int ir2 = digitalRead(IR2_PIN);
+  bool blocked = ir1 == LOW || ir2 == LOW;
+  setConveyor(!blocked);
+  if (ir1 != lastIr1 || ir2 != lastIr2 || millis() - lastLog >= 1000) {
+    Serial.printf("IR_TEST: G32=%d G33=%d BLOCKED=%d REQUEST=%s RELAY_CMD=%d\n",
+                  ir1, ir2, blocked, blocked ? "STOP" : "RUN",
+                  blocked ? RELAY_OFF : RELAY_ON);
+    lastIr1 = ir1;
+    lastIr2 = ir2;
+    lastLog = millis();
+  }
+  delay(10);
+}
+
+void logSensorChanges() {
+  static int lastIr1 = -1;
+  static int lastIr2 = -1;
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 50)
+    return;
+  lastCheck = millis();
+  int ir1 = digitalRead(IR1_PIN);
+  int ir2 = digitalRead(IR2_PIN);
+  if (ir1 != lastIr1 || ir2 != lastIr2) {
+    Serial.printf("IR_RAW: G32=%d G33=%d (0=blocked, 1=clear)\n", ir1, ir2);
+    lastIr1 = ir1;
+    lastIr2 = ir2;
+  }
 }
 
 void homeSortingServos() {
@@ -232,7 +250,7 @@ void sortingFault(const char *reason) {
   pendingScanId = 0;
   homeSortingServos();
   setSortingPhase(SortingPhase::FAULT);
-  Serial.printf("SORT_ERROR: %s; conveyor stopped; press Start to retry\n", reason);
+  Serial.printf("SORT_ERROR: %s; conveyor stopped; inspect machine before resetting ESP32\n", reason);
   PiSerial.printf("ERROR,%s\n", reason);
 }
 
@@ -296,7 +314,7 @@ void handlePiLine(const char *line) {
 }
 
 void pollPiUart() {
-  // Bound work per loop so incoming UART traffic cannot starve the Stop button.
+  // Bound work per loop so incoming UART traffic cannot starve sensor and timeout checks.
   for (uint8_t count = 0; count < 64 && PiSerial.available() > 0; ++count) {
     char c = static_cast<char>(PiSerial.read());
     if (c == 'P' && piLineLength == 0 && !piLineOverflow) {
@@ -317,59 +335,24 @@ void pollPiUart() {
   }
 }
 
-void pollSortingButton() {
-  static int lastReading = HIGH;
-  static int stableState = HIGH;
-  static unsigned long changedAt = 0;
-  int reading = digitalRead(BUTTON_PIN);
-  if (reading != lastReading) {
-    changedAt = millis();
-    lastReading = reading;
-  }
-  if (millis() - changedAt < 50 || reading == stableState)
-    return;
-  stableState = reading;
-  if (stableState != LOW)
-    return;
-
-  if (isSystemRunning) {
-    setConveyor(false);
-    isSystemRunning = false;
-    pendingScanId = 0;
-    currentMango = Mango();
-    homeSortingServos();
-    setSortingPhase(SortingPhase::HOMING);
-    Serial.println("SYSTEM_STOP");
-    PiSerial.println("SYSTEM_STOP");
-  } else if (!servoDriverReady ||
-             sortingPhase == SortingPhase::HOMING ||
-             (sortingPhase == SortingPhase::FAULT &&
-              millis() - sortingPhaseStarted < SERVO_RETURN_MS)) {
-    Serial.println("START_BLOCKED: check PCA9685 and wait for servos to return");
-  } else {
-    isSystemRunning = true;
-    currentMango = Mango();
-    setSortingPhase(digitalRead(IR1_PIN) == LOW ?
-                    SortingPhase::SCAN_SETTLING : SortingPhase::MOVING);
-    Serial.println("SYSTEM_START");
-    PiSerial.println("SYSTEM_START");
-  }
-}
-
 void runPiSorting() {
-  pollSortingButton();
   pollPiUart();
   unsigned long now = millis();
 
   switch (sortingPhase) {
-  case SortingPhase::STOPPED:
   case SortingPhase::FAULT:
     setConveyor(false);
     break;
   case SortingPhase::HOMING:
     setConveyor(false);
-    if (now - sortingPhaseStarted >= SERVO_RETURN_MS)
-      setSortingPhase(SortingPhase::STOPPED);
+    if (now - sortingPhaseStarted >= SERVO_RETURN_MS) {
+      isSystemRunning = true;
+      currentMango = Mango();
+      setSortingPhase(digitalRead(IR1_PIN) == LOW ?
+                      SortingPhase::SCAN_SETTLING : SortingPhase::MOVING);
+      Serial.println("SYSTEM_AUTO_START");
+      PiSerial.println("SYSTEM_AUTO_START");
+    }
     break;
   case SortingPhase::MOVING:
     if (digitalRead(IR1_PIN) == LOW) {
@@ -451,7 +434,7 @@ void runPiSorting() {
 
   static unsigned long lastLog = 0;
   if (now - lastLog >= 1000) {
-    Serial.printf("SORT_STATUS: STATE=%s IR1=%d IR2=%d ENABLED=%d RELAY_CMD=%d\n",
+    Serial.printf("SORT_STATUS: FW=AUTO_UART_DIAG1 STATE=%s IR1=%d IR2=%d ENABLED=%d RELAY_CMD=%d\n",
                   sortingPhaseName(), digitalRead(IR1_PIN), digitalRead(IR2_PIN),
                   isSystemRunning, digitalRead(RELAY_PIN));
     lastLog = now;
@@ -461,16 +444,24 @@ void runPiSorting() {
 
 void setup() {
   Serial.begin(115200);
-  PiSerial.begin(PI_UART_BAUD, SERIAL_8N1, PI_UART_RX_PIN, PI_UART_TX_PIN);
-  scanSequence = esp_random();
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(IR1_PIN, INPUT);
   pinMode(IR2_PIN, INPUT);
   pinMode(IR3_PIN, INPUT);
   pinMode(RELAY_PIN, OUTPUT);
 
   digitalWrite(RELAY_PIN, RELAY_OFF);
+  if (IR_BELT_TEST_MODE) {
+    Serial.println("FIRMWARE: IR_STOP_TEST; IR1 G32 + IR2 G33; no Pi, no servo");
+    Serial.println("TEST_READY: either IR LOW -> STOP; both HIGH -> automatic RUN");
+    runIrBeltStopTest();
+    return;
+  }
+
+  PiSerial.begin(PI_UART_BAUD, SERIAL_8N1, PI_UART_RX_PIN, PI_UART_TX_PIN);
+  scanSequence = esp_random();
+  Serial.println("FIRMWARE: AUTO_UART_DIAG1; automatic startup, no Start button");
+  Serial.printf("BOOT_DIAG: RESET_REASON=%d\n", static_cast<int>(esp_reset_reason()));
 
   if (SENSOR_STOP_TEST_MODE) {
     if (!pwm.begin()) {
@@ -485,7 +476,8 @@ void setup() {
     for (auto &state : testServos)
       state.phaseStarted = millis();
     servoDriverReady = true;
-    Serial.println("TEST_READY: IR1 (GPIO32) and IR2 (GPIO33); clear both, then press button to start");
+    isSystemRunning = true;
+    Serial.println("TEST_READY: IR1 (GPIO32) and IR2 (GPIO33); automatic mode after servos return");
     Serial.println("TEST_SERVOS: IR1 -> CH0, IR2 -> CH1; one cycle per obstacle");
     Serial.println("TEST_AUTO_RESUME: conveyor restarts when both sensors are clear and servos are home");
     return;
@@ -502,10 +494,15 @@ void setup() {
   homeSortingServos();
   setSortingPhase(SortingPhase::HOMING);
   Serial.println("SORT_READY: IR1 scan -> Pi UART; type 3 CH0, type 2 at IR2 CH1");
-  Serial.println("SORT_READY: press Start after servos return; one mango at a time");
+  Serial.println("SORT_READY: automatic start after servos return; one mango at a time");
 }
 
 void loop() {
+  if (IR_BELT_TEST_MODE) {
+    runIrBeltStopTest();
+    return;
+  }
+  logSensorChanges();
   if (SENSOR_STOP_TEST_MODE) {
     pollPiUart();
     runSensorStopTest();

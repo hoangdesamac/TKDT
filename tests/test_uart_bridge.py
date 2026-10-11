@@ -62,6 +62,16 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(bridge.check_connection(uart))
         self.assertEqual(uart.writes, [b"P"])
 
+    def test_auto_boot_scan_is_not_lost_during_ping(self):
+        uart = FakeUart((b"SCAN,42\n", b"PONG\r\n"))
+        pending = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(bridge.check_connection(uart, pending))
+        self.assertEqual(pending, [42])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            bridge.serve_scans(uart, "3", pending)
+        self.assertEqual(uart.writes, [b"P", b"RESULT,42,3\n"])
+
 
 if __name__ == "__main__":
     unittest.main()

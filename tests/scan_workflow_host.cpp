@@ -1,6 +1,11 @@
 #include <cstdlib>
 #include <iostream>
+#define IR_BELT_TEST_ENABLED 0
 #include "../src/main.cpp"
+
+bool mockConveyorStopped() {
+  return mockPins[RELAY_PIN] == RELAY_OFF;
+}
 
 void check(bool condition, const char *message) {
   if (!condition) {
@@ -14,18 +19,11 @@ void tick(unsigned long elapsed = 10, int ir1 = HIGH, int ir2 = HIGH,
   mockTime += elapsed;
   mockPins[IR1_PIN] = ir1;
   mockPins[IR2_PIN] = ir2;
-  mockPins[BUTTON_PIN] = button;
+  mockPins[34] = button;
   loop();
 }
 
-void press(int ir1 = HIGH, int ir2 = HIGH) {
-  tick(10, ir1, ir2, LOW);
-  tick(60, ir1, ir2, LOW);
-  tick(10, ir1, ir2);
-  tick(60, ir1, ir2);
-}
-
-void resetMachine() {
+void resetMachine(int ir1 = HIGH, int ir2 = HIGH) {
   mockTime += 20000;
   for (int &pin : mockPins) pin = HIGH;
   mockPcaPresent = true;
@@ -35,20 +33,23 @@ void resetMachine() {
   pendingScanId = 0;
   piLineLength = 0;
   piLineOverflow = false;
+  Serial.rx.clear();
+  Serial.tx.clear();
   PiSerial.rx.clear();
   PiSerial.tx.clear();
   setup();
-  tick(600);
-  tick(60);
+  tick(600, ir1, ir2);
+  tick(60, ir1, ir2);
   servoCommands.clear();
 }
 
 uint32_t scanAtIr1() {
-  press();
-  check(mockPins[RELAY_PIN] == RELAY_ON, "Start runs clear belt");
+  check(mockPins[RELAY_PIN] == RELAY_ON, "automatic startup runs clear belt");
   tick(10, LOW);
   check(mockPins[RELAY_PIN] == RELAY_OFF, "IR1 stops belt immediately");
   tick(250, LOW);
+  check(Serial.tx.find("IR_RAW: G32=0") != std::string::npos,
+        "raw log identifies IR1 detection");
   check(sortingPhase == SortingPhase::WAIT_PI && pendingScanId != 0,
         "stopped mango requests a scan");
   check(PiSerial.tx.find("SCAN," + std::to_string(pendingScanId) + "\n") !=
@@ -64,11 +65,20 @@ void respond(uint32_t id, int type, int ir1 = LOW, int ir2 = HIGH) {
 
 int main() {
   resetMachine();
-  check(!isSystemRunning && mockPins[RELAY_PIN] == RELAY_OFF,
-        "boot does not auto-start");
+  check(isSystemRunning && mockPins[RELAY_PIN] == RELAY_ON,
+        "boot automatically starts after homing");
+  check(Serial.tx.find("FIRMWARE: AUTO_UART_DIAG1") != std::string::npos,
+        "boot identifies diagnostic automatic firmware");
+  tick(100, HIGH, HIGH, LOW);
+  tick(100, HIGH, HIGH, HIGH);
+  check(isSystemRunning, "floating G34 cannot toggle automatic mode");
+  Serial.inject("STOP\r\nSTART\r\n");
+  tick();
+  check(isSystemRunning && mockPins[RELAY_PIN] == RELAY_ON,
+        "removed USB manual commands do not control the machine");
   PiSerial.inject("P");
   tick();
-  check(PiSerial.tx.find("PONG") != std::string::npos, "ping while stopped");
+  check(PiSerial.tx.find("PONG") != std::string::npos, "ping in automatic mode");
 
   uint32_t id = scanAtIr1();
   tick(300, HIGH);
@@ -138,27 +148,21 @@ int main() {
         "Pi timeout latches belt off");
   respond(id, 3);
   check(sortingPhase == SortingPhase::FAULT, "late result cannot restart fault");
-  tick(600, LOW);
-  press(LOW);
+  tick(30000, HIGH);
+  Serial.inject("START\n");
+  tick();
+  check(sortingPhase == SortingPhase::FAULT && !isSystemRunning &&
+        mockPins[RELAY_PIN] == RELAY_OFF, "fault never automatically restarts");
+
+  resetMachine(LOW);
   tick(250, LOW);
   uint32_t retryId = pendingScanId;
   check(retryId != id && sortingPhase == SortingPhase::WAIT_PI,
-        "retry parked mango gets new scan ID");
+        "reset with parked mango automatically requests a fresh scan");
   respond(id, 3);
-  check(sortingPhase == SortingPhase::WAIT_PI, "old result cannot satisfy retry");
+  check(sortingPhase == SortingPhase::WAIT_PI, "old result cannot satisfy new boot");
   respond(retryId, 3);
-  press(LOW);
-  check(!isSystemRunning && mockPins[RELAY_PIN] == RELAY_OFF && pendingScanId == 0,
-        "Stop stays responsive during gate");
-  tick(600);
-  check(sortingPhase == SortingPhase::STOPPED, "Stop does not auto-resume");
-
-  resetMachine();
-  id = scanAtIr1();
-  press(LOW);
-  respond(id, 3);
-  check(!isSystemRunning && mockPins[RELAY_PIN] == RELAY_OFF,
-        "Stop cancels a pending classification");
+  check(sortingPhase == SortingPhase::GATING, "fresh result works after reset");
 
   resetMachine();
   id = scanAtIr1();
@@ -186,8 +190,7 @@ int main() {
   servoDriverReady = false;
   setup();
   tick(600);
-  press();
   check(sortingPhase == SortingPhase::FAULT && !isSystemRunning &&
-        mockPins[RELAY_PIN] == RELAY_OFF, "missing PCA9685 blocks Start");
-  std::cout << "PASS: classes 1/2/3, UART framing/IDs, servo/belt sequence, Stop, retries and faults\n";
+        mockPins[RELAY_PIN] == RELAY_OFF, "missing PCA9685 prevents automatic startup");
+  std::cout << "PASS: classes 1/2/3, UART framing/IDs, servo/belt sequence, automatic startup, reset and faults\n";
 }
