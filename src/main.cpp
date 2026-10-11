@@ -7,7 +7,7 @@
 #include <esp_system.h>
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
-
+// servo
 const int servoMin = 150; // Tương ứng với 0 độ
 const int servoMax = 600; // Tương ứng với 180 độ
 
@@ -492,12 +492,12 @@ void setup() {
   pwm.setPWMFreq(60);
 
   // Gạt kênh 0 và kênh 1 về 45 độ ngay khi khởi động
-  setServoAngle(0, 20); // gạt xoài
-  delay(1000);
-  setServoAngle(0, 65); // gạt 0
-  delay(1000);
-  setServoAngle(0, 20);
-  delay(1000);
+  // setServoAngle(0, 20); // gạt xoài
+  // delay(1000);
+  // setServoAngle(0, 65); // gạt 0
+  // delay(1000);
+  // setServoAngle(0, 20);
+  // delay(1000);
   digitalWrite(RELAY_PIN, RELAY_OFF);
   if (IR_BELT_TEST_MODE) {
     Serial.println(
