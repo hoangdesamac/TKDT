@@ -47,117 +47,8 @@ constexpr unsigned long BELT_SETTLE_MS = 200;
 constexpr unsigned long SERVO_HOLD_MS = 800;
 constexpr unsigned long SERVO_RETURN_MS = 500;
 
-enum class TestServoPhase { IDLE, SETTLING, GATING, RETURNING };
-struct TestServoState {
-  TestServoPhase phase = TestServoPhase::RETURNING;
-  unsigned long phaseStarted = 0;
-  bool obstacleHandled = false;
-};
-TestServoState testServos[2];
-bool servoDriverReady = false;
-
 bool isSystemRunning = false;
 Mango currentMango;
-
-bool updateTestServos(uint8_t sensorMask) {
-  const uint8_t channels[2] = {SERVO1_CH, SERVO2_CH};
-  unsigned long now = millis();
-  bool busy = false;
-
-  for (uint8_t i = 0; i < 2; ++i) {
-    TestServoState &state = testServos[i];
-    bool blocked = (sensorMask & (1 << i)) != 0;
-    if (!blocked)
-      state.obstacleHandled = false;
-
-    if (!isSystemRunning && state.phase == TestServoPhase::SETTLING) {
-      state.phase = TestServoPhase::IDLE;
-    } else if (state.phase == TestServoPhase::GATING &&
-               (!isSystemRunning ||
-                now - state.phaseStarted >= SERVO_HOLD_MS)) {
-      pwm.writeMicroseconds(channels[i], SERVO_REST_US);
-      state.phase = TestServoPhase::RETURNING;
-      state.phaseStarted = now;
-      Serial.printf("TEST_SERVO: CH%d RETURN\n", channels[i]);
-    } else if (state.phase == TestServoPhase::RETURNING &&
-               now - state.phaseStarted >= SERVO_RETURN_MS) {
-      state.phase = TestServoPhase::IDLE;
-    }
-
-    if (state.phase == TestServoPhase::IDLE && isSystemRunning && blocked &&
-        !state.obstacleHandled) {
-      state.obstacleHandled = true;
-      state.phase = TestServoPhase::SETTLING;
-      state.phaseStarted = now;
-    }
-
-    if (state.phase == TestServoPhase::SETTLING &&
-        now - state.phaseStarted >= BELT_SETTLE_MS) {
-      pwm.writeMicroseconds(channels[i], SERVO_GATE_US);
-      state.phase = TestServoPhase::GATING;
-      state.phaseStarted = now;
-      Serial.printf("TEST_SERVO: IR%d -> CH%d GATE\n", i + 1, channels[i]);
-    }
-    busy |= state.phase != TestServoPhase::IDLE;
-  }
-  return busy;
-}
-
-void runSensorStopTest() {
-  if (!servoDriverReady) {
-    isSystemRunning = false;
-    digitalWrite(RELAY_PIN, RELAY_OFF);
-    delay(10);
-    return;
-  }
-
-  static uint8_t lastSensorMask = 0xFF;
-  static bool lastConveyorRunning = false;
-  static unsigned long lastStatusLog = 0;
-
-  int ir1Raw = digitalRead(IR1_PIN);
-  int ir2Raw = digitalRead(IR2_PIN);
-  uint8_t sensorMask = 0;
-  if (ir1Raw == LOW)
-    sensorMask |= 1;
-  if (ir2Raw == LOW)
-    sensorMask |= 2;
-  bool obstacleDetected = sensorMask != 0;
-
-  if (sensorMask != lastSensorMask) {
-    Serial.printf("TEST_IR: IR1=%d IR2=%d (1=blocked)\n", (sensorMask & 1) != 0,
-                  (sensorMask & 2) != 0);
-    lastSensorMask = sensorMask;
-  }
-
-  // Stop the belt before any servo command, then wait for the return motion.
-  if (!isSystemRunning || obstacleDetected)
-    digitalWrite(RELAY_PIN, RELAY_OFF);
-  bool servosBusy = updateTestServos(sensorMask);
-  bool conveyorRunning = isSystemRunning && !obstacleDetected && !servosBusy;
-  int relayCommand = conveyorRunning ? RELAY_ON : RELAY_OFF;
-  digitalWrite(RELAY_PIN, relayCommand);
-
-  if (conveyorRunning != lastConveyorRunning) {
-    if (conveyorRunning) {
-      Serial.println("TEST_CONVEYOR_RUNNING");
-    } else if (isSystemRunning && obstacleDetected) {
-      Serial.println("TEST_OBSTACLE_STOP: auto-resume when both IRs are clear "
-                     "and servos are home");
-    }
-    lastConveyorRunning = conveyorRunning;
-  }
-
-  // Report raw inputs separately from the interpreted obstacle flags.
-  if (millis() - lastStatusLog >= 1000) {
-    Serial.printf("TEST_RAW: IR1=%d IR2=%d ENABLED=%d RUN=%d "
-                  "SERVO_BUSY=%d RELAY_CMD=%d\n",
-                  ir1Raw, ir2Raw, isSystemRunning, conveyorRunning, servosBusy,
-                  relayCommand);
-    lastStatusLog = millis();
-  }
-  delay(10);
-}
 
 constexpr int PI_UART_RX_PIN = 16;
 constexpr int PI_UART_TX_PIN = 17;
@@ -271,18 +162,11 @@ void logSensorChanges() {
   }
 }
 
-void homeSortingServos() {
-  if (servoDriverReady) {
-    pwm.writeMicroseconds(SERVO1_CH, SERVO_REST_US);
-    pwm.writeMicroseconds(SERVO2_CH, SERVO_REST_US);
-  }
-}
-
 void sortingFault(const char *reason) {
   setConveyor(false);
   isSystemRunning = false;
   pendingScanId = 0;
-  homeSortingServos();
+  // homeSortingServos();
   setSortingPhase(SortingPhase::FAULT);
   Serial.printf("SORT_ERROR: %s; conveyor stopped; inspect machine before "
                 "resetting ESP32\n",
@@ -520,14 +404,6 @@ void setup() {
       Serial.println("TEST_ERROR: PCA9685 not found; conveyor stays stopped");
       return;
     }
-    // pwm.setOscillatorFrequency(27000000);
-    // pwm.setPWMFreq(SERVO_FREQ);
-    // Wire.setClock(400000);
-    // pwm.writeMicroseconds(SERVO1_CH, SERVO_REST_US);
-    // pwm.writeMicroseconds(SERVO2_CH, SERVO_REST_US);
-    for (auto &state : testServos)
-      state.phaseStarted = millis();
-    servoDriverReady = true;
     isSystemRunning = true;
     Serial.println("TEST_READY: IR1 (GPIO32) and IR2 (GPIO33); automatic mode "
                    "after servos return");
@@ -542,11 +418,6 @@ void setup() {
     sortingFault("PCA9685_NOT_FOUND");
     return;
   }
-  // pwm.setOscillatorFrequency(27000000);
-  // pwm.setPWMFreq(SERVO_FREQ);
-  // Wire.setClock(400000);
-  servoDriverReady = true;
-  homeSortingServos();
   setSortingPhase(SortingPhase::HOMING);
   Serial.println(
       "SORT_READY: IR1 scan -> Pi UART; type 3 CH0, type 2 at IR2 CH1");
@@ -562,7 +433,7 @@ void loop() {
   logSensorChanges();
   if (SENSOR_STOP_TEST_MODE) {
     pollPiUart();
-    runSensorStopTest();
+    // runSensorStopTest();
     return;
   }
   runPiSorting();
