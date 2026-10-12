@@ -1,31 +1,19 @@
 #include "mango.h"
-#include <Adafruit_PWMServoDriver.h>
-#include <Arduino.h>
-#include <Wire.h>
 #include <cstdio>
 #include <cstring>
 #include <esp_system.h>
-
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
-// servo
-const int servoMin = 150; // Tương ứng với 0 độ
-const int servoMax = 600; // Tương ứng với 180 độ
-
-// Hàm chuyển đổi góc (0 - 180 độ) sang xung PWM
-void setServoAngle(uint8_t channel, int angle) {
-  int pulse = map(angle, 0, 180, servoMin, servoMax);
-  pwm.setPWM(channel, 0, pulse);
-}
-
+#include <Adafruit_PWMServoDriver.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include "cyd_link.h"
+#include "camera_sorter.h"
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 constexpr uint8_t CYD_MAC_ADDRESS[6] = {0xF4, 0x2D, 0xC9, 0x7A, 0x6A, 0xD4};
-
 #ifndef IR_BELT_TEST_ENABLED
 #define IR_BELT_TEST_ENABLED 1
 #endif
-
 constexpr bool IR_BELT_TEST_MODE = IR_BELT_TEST_ENABLED != 0;
 constexpr bool SENSOR_STOP_TEST_MODE = false;
-
 #define RELAY_PIN 26
 
 #define IR1_PIN 32
@@ -33,7 +21,6 @@ constexpr bool SENSOR_STOP_TEST_MODE = false;
 
 #define RELAY_ON LOW
 #define RELAY_OFF HIGH
-
 #define SERVO_FREQ 50
 #define USMIN 500
 #define USMAX 2500
@@ -41,400 +28,346 @@ constexpr bool SENSOR_STOP_TEST_MODE = false;
 #define SERVO1_CH 0
 #define SERVO2_CH 1
 
-constexpr uint16_t SERVO_REST_US = 1500;
-constexpr uint16_t SERVO_GATE_US = 1700;
-constexpr unsigned long BELT_SETTLE_MS = 200;
-constexpr unsigned long SERVO_HOLD_MS = 800;
-constexpr unsigned long SERVO_RETURN_MS = 500;
+const int servoMin = 150;
+const int servoMax = 600;
+constexpr int SERVO1_HOME_ANGLE = 65;
+constexpr int SERVO1_GATE_ANGLE = 20;
+// Temporary servo2 angles: calibrate these two values on the actual mechanism.
+constexpr int SERVO2_HOME_ANGLE = 65;
+constexpr int SERVO2_GATE_ANGLE = 20;
+constexpr uint8_t IR1_ACTIVE_LEVEL = LOW;
+constexpr uint32_t IR1_DEBOUNCE_MS = 30;
+constexpr uint8_t IR2_ACTIVE_LEVEL = LOW;
+constexpr uint32_t IR2_DEBOUNCE_MS = 30;
 
+#ifndef ESPNOW_CHANNEL
+#define ESPNOW_CHANNEL 1
+#endif
+
+namespace {
+CydLink cydLink;
+CameraSorter cameraSorter;
 bool isSystemRunning = false;
-Mango currentMango;
+bool servoReady = false;
+bool beltOutputOn = false;
+bool gateOutputExtended = false;
+bool gate2OutputExtended = false;
+bool ir1RawBlocked = false;
+bool ir1Blocked = false;
+uint32_t ir1RawChangedMs = 0;
+bool ir2RawBlocked = false;
+bool ir2Blocked = false;
+bool ir2StatusChanged = false;
+uint32_t ir2RawChangedMs = 0;
+uint32_t cameraScanId = 0;
+CameraSorter::State reportedState = CameraSorter::State::Stopped;
+uint8_t systemPhase = cyd::PHASE_HOMING;
+bool statusDirty = true;
+bool hasStatusAttempt = false;
+uint32_t lastStatusAttemptMs = 0;
+uint32_t lastStatusQueuedMs = 0;
+constexpr uint32_t STATUS_INTERVAL_MS = 1000;
+constexpr uint32_t STATUS_RETRY_MS = 250;
+String usbLine;
+bool discardUsbLine = false;
 
-constexpr int PI_UART_RX_PIN = 16;
-constexpr int PI_UART_TX_PIN = 17;
-constexpr uint32_t PI_UART_BAUD = 115200;
-constexpr unsigned long PI_SCAN_TIMEOUT_MS = 15000;
-constexpr unsigned long MANGO_TRAVEL_TIMEOUT_MS = 10000;
-constexpr unsigned long MANGO_DROP_MS = 1000;
-constexpr unsigned long IR_CLEAR_MS = 150;
-
-HardwareSerial PiSerial(2);
-enum class SortingPhase {
-  HOMING,
-  MOVING,
-  SCAN_SETTLING,
-  WAIT_PI,
-  WAIT_IR2,
-  GATE_SETTLING,
-  GATING,
-  RELEASING,
-  RETURNING,
-  FAULT
-};
-SortingPhase sortingPhase = SortingPhase::HOMING;
-unsigned long sortingPhaseStarted = 0;
-unsigned long releaseClearStarted = 0;
-bool releaseClearTracking = false;
-bool releaseUsesServo = false;
-uint8_t activeServoChannel = SERVO1_CH;
-int releaseSensorPin = IR1_PIN;
-uint32_t scanSequence = 0;
-uint32_t pendingScanId = 0;
-char piLine[64];
-size_t piLineLength = 0;
-bool piLineOverflow = false;
-
-const char *sortingPhaseName() {
-  switch (sortingPhase) {
-  case SortingPhase::HOMING:
-    return "HOMING";
-  case SortingPhase::MOVING:
-    return "MOVING";
-  case SortingPhase::SCAN_SETTLING:
-    return "SCAN_SETTLING";
-  case SortingPhase::WAIT_PI:
-    return "WAIT_PI";
-  case SortingPhase::WAIT_IR2:
-    return "WAIT_IR2";
-  case SortingPhase::GATE_SETTLING:
-    return "GATE_SETTLING";
-  case SortingPhase::GATING:
-    return "GATING";
-  case SortingPhase::RELEASING:
-    return "RELEASING";
-  case SortingPhase::RETURNING:
-    return "RETURNING";
-  case SortingPhase::FAULT:
-    return "FAULT";
-  }
-  return "UNKNOWN";
+// Call this from the conveyor state machine whenever its real phase changes.
+void setSystemPhase(uint8_t phase) {
+  if (phase == systemPhase) return;
+  systemPhase = phase;
+  statusDirty = true;
 }
 
-void setSortingPhase(SortingPhase phase) {
-  sortingPhase = phase;
-  sortingPhaseStarted = millis();
-  Serial.printf("SORT_STATE: %s\n", sortingPhaseName());
-}
-
-void setConveyor(bool running) {
-  static int lastCommand = -1;
-  int command = running ? RELAY_ON : RELAY_OFF;
-  digitalWrite(RELAY_PIN, command);
-  if (command != lastCommand) {
-    Serial.printf("RELAY_CMD: G26=%d REQUEST=%s\n", command,
-                  running ? "RUN" : "STOP");
-    lastCommand = command;
+const char *stateName(CameraSorter::State state) {
+  switch (state) {
+    case CameraSorter::State::Stopped: return "STOPPED";
+    case CameraSorter::State::Moving: return "MOVING";
+    case CameraSorter::State::CameraSettling: return "CAMERA_SETTLING";
+    case CameraSorter::State::WaitingPi: return "WAIT_CAMERA_RESULT";
+    case CameraSorter::State::GateSettling: return "SERVO1_SETTLING";
+    case CameraSorter::State::Rejecting: return "REJECT_UNTIL_IR1_CLEAR";
+    case CameraSorter::State::Returning: return "SERVO1_RETURNING";
+    case CameraSorter::State::Passing: return "PASS_TO_DARK_CHAMBER";
+    case CameraSorter::State::MovingToDark: return "MOVING_TO_IR2";
+    case CameraSorter::State::WaitingDarkPi: return "WAIT_DARK_RESULT";
+    case CameraSorter::State::Gate2Settling: return "SERVO2_SETTLING";
+    case CameraSorter::State::Rejecting2: return "SOUR_UNTIL_IR2_CLEAR";
+    case CameraSorter::State::Returning2: return "SERVO2_RETURNING";
+    case CameraSorter::State::SweetPassing: return "SWEET_TO_END";
+    default: return "FAULT";
   }
 }
 
-void runIrBeltStopTest() {
-  static int lastIr1 = -1;
-  static int lastIr2 = -1;
-  static unsigned long lastLog = 0;
-  int ir1 = digitalRead(IR1_PIN);
-  int ir2 = digitalRead(IR2_PIN);
-  bool blocked = ir1 == LOW || ir2 == LOW;
-  setConveyor(!blocked);
-  if (ir1 != lastIr1 || ir2 != lastIr2 || millis() - lastLog >= 1000) {
-    Serial.printf("IR_TEST: G32=%d G33=%d BLOCKED=%d REQUEST=%s RELAY_CMD=%d\n",
-                  ir1, ir2, blocked, blocked ? "STOP" : "RUN",
-                  blocked ? RELAY_OFF : RELAY_ON);
-    lastIr1 = ir1;
-    lastIr2 = ir2;
-    lastLog = millis();
-  }
-  delay(10);
-}
-
-void logSensorChanges() {
-  static int lastIr1 = -1;
-  static int lastIr2 = -1;
-  static unsigned long lastCheck = 0;
-  if (millis() - lastCheck < 50)
-    return;
-  lastCheck = millis();
-  int ir1 = digitalRead(IR1_PIN);
-  int ir2 = digitalRead(IR2_PIN);
-  if (ir1 != lastIr1 || ir2 != lastIr2) {
-    Serial.printf("IR_RAW: G32=%d G33=%d (0=blocked, 1=clear)\n", ir1, ir2);
-    lastIr1 = ir1;
-    lastIr2 = ir2;
+uint8_t phaseForState(CameraSorter::State state) {
+  switch (state) {
+    case CameraSorter::State::Stopped: return cyd::PHASE_HOMING;
+    case CameraSorter::State::CameraSettling: return cyd::PHASE_SCAN_SETTLING;
+    case CameraSorter::State::WaitingPi: return cyd::PHASE_WAIT_PI;
+    case CameraSorter::State::WaitingDarkPi: return cyd::PHASE_WAIT_PI;
+    case CameraSorter::State::Passing:
+    case CameraSorter::State::MovingToDark: return cyd::PHASE_WAIT_IR2;
+    case CameraSorter::State::GateSettling: return cyd::PHASE_GATE_SETTLING;
+    case CameraSorter::State::Gate2Settling: return cyd::PHASE_GATE_SETTLING;
+    case CameraSorter::State::Rejecting: return cyd::PHASE_GATING;
+    case CameraSorter::State::Rejecting2: return cyd::PHASE_GATING;
+    case CameraSorter::State::Returning: return cyd::PHASE_RETURNING;
+    case CameraSorter::State::Returning2: return cyd::PHASE_RETURNING;
+    case CameraSorter::State::SweetPassing: return cyd::PHASE_RELEASING;
+    case CameraSorter::State::Fault: return cyd::PHASE_FAULT;
+    default: return cyd::PHASE_MOVING;
   }
 }
 
-void sortingFault(const char *reason) {
-  setConveyor(false);
-  isSystemRunning = false;
-  pendingScanId = 0;
-  // homeSortingServos();
-  setSortingPhase(SortingPhase::FAULT);
-  Serial.printf("SORT_ERROR: %s; conveyor stopped; inspect machine before "
-                "resetting ESP32\n",
-                reason);
-  PiSerial.printf("ERROR,%s\n", reason);
+void setServoAngle(uint8_t channel, int angle) {
+  angle = constrain(angle, 0, 180);
+  const int pulse = map(angle, 0, 180, servoMin, servoMax);
+  pwm.setPWM(channel, 0, pulse);
 }
 
-void beginRelease(int sensorPin, bool usesServo) {
-  releaseSensorPin = sensorPin;
-  releaseUsesServo = usesServo;
-  releaseClearTracking = false;
-  setSortingPhase(SortingPhase::RELEASING);
-  setConveyor(true);
+void syncSorterOutputs(bool force = false) {
+  const bool beltOn = cameraSorter.beltOn();
+  if (force || beltOn != beltOutputOn) {
+    const uint8_t level = beltOn ? RELAY_ON : RELAY_OFF;
+    digitalWrite(RELAY_PIN, level);
+    beltOutputOn = beltOn;
+    Serial.printf("RELAY_CMD PIN=%u LEVEL=%u REQUEST=%s\n",
+                  RELAY_PIN, level, beltOn ? "ON" : "OFF");
+  }
+
+  const bool gateExtended = cameraSorter.gateExtended();
+  if (servoReady && (force || gateExtended != gateOutputExtended)) {
+    const int angle = gateExtended ? SERVO1_GATE_ANGLE : SERVO1_HOME_ANGLE;
+    setServoAngle(SERVO1_CH, angle);
+    gateOutputExtended = gateExtended;
+    Serial.printf("SERVO1 ANGLE=%d\n", angle);
+  }
+
+  const bool gate2Extended = cameraSorter.gate2Extended();
+  if (servoReady && (force || gate2Extended != gate2OutputExtended)) {
+    const int angle = gate2Extended ? SERVO2_GATE_ANGLE : SERVO2_HOME_ANGLE;
+    setServoAngle(SERVO2_CH, angle);
+    gate2OutputExtended = gate2Extended;
+    Serial.printf("SERVO2 ANGLE=%d\n", angle);
+  }
+
+  if (isSystemRunning != cameraSorter.running()) {
+    isSystemRunning = cameraSorter.running();
+    statusDirty = true;
+  }
+  setSystemPhase(phaseForState(cameraSorter.state()));
+
+  if (reportedState != cameraSorter.state()) {
+    reportedState = cameraSorter.state();
+    Serial.printf("STATE %s\n", stateName(reportedState));
+    if (reportedState == CameraSorter::State::Fault) {
+      switch (cameraSorter.fault()) {
+        case CameraSorter::Fault::PiTimeout:
+          Serial.println("ERR CAMERA_TIMEOUT"); break;
+        case CameraSorter::Fault::Ir1Timeout:
+          Serial.println("ERR IR1_CLEAR_TIMEOUT"); break;
+        case CameraSorter::Fault::DarkPiTimeout:
+          Serial.println("ERR DARK_PI_TIMEOUT"); break;
+        case CameraSorter::Fault::Ir2Timeout:
+          Serial.println("ERR IR2_CLEAR_TIMEOUT"); break;
+        case CameraSorter::Fault::Ir2ArrivalTimeout:
+          Serial.println("ERR IR2_ARRIVAL_TIMEOUT"); break;
+        case CameraSorter::Fault::ServoMissing:
+          Serial.println("ERR PCA9685_NOT_READY"); break;
+        default: break;
+      }
+    }
+  }
 }
 
-void beginGate(uint8_t channel) {
-  setConveyor(false);
-  activeServoChannel = channel;
-  pwm.writeMicroseconds(channel, SERVO_GATE_US);
-  setSortingPhase(SortingPhase::GATING);
-  Serial.printf("SORT_SERVO: CH%d GATE\n", channel);
+void applyRunCommand(bool run) {
+  if (run && !servoReady)
+    cameraSorter.fail(CameraSorter::Fault::ServoMissing, millis());
+  else
+    cameraSorter.setRunning(run, millis());
+  syncSorterOutputs(true);
+  statusDirty = true;
 }
 
-void handlePiLine(const char *line) {
-  if (strcmp(line, "P") == 0) {
-    PiSerial.println("PONG");
-    return;
-  }
+// GUI LENH CAMERA TU ESP32 SANG PI QUA USB/COM (115200 baud).
+// Pi xu ly anh va tra ve mot dong "0\n" hoac "1\n".
+void sendCameraCommandToPi() {
+  Serial.println("CAMERA");
+}
 
-  unsigned long requestId = 0;
-  unsigned int result = 0;
-  int consumed = 0;
-  if (sscanf(line, "RESULT,%lu,%u%n", &requestId, &result, &consumed) != 2 ||
-      consumed != static_cast<int>(strlen(line)) || requestId == 0 ||
-      requestId > UINT32_MAX || result < 1 || result > 3) {
-    Serial.printf("PI_IGNORED: %s\n", line);
-    return;
+void updateIr1(uint32_t now) {
+  const bool rawBlocked = digitalRead(IR1_PIN) == IR1_ACTIVE_LEVEL;
+  if (rawBlocked != ir1RawBlocked) {
+    ir1RawBlocked = rawBlocked;
+    ir1RawChangedMs = now;
   }
-  char canonical[64];
-  snprintf(canonical, sizeof(canonical), "RESULT,%lu,%u", requestId, result);
-  if (strcmp(canonical, line) != 0) {
-    Serial.println("PI_IGNORED: invalid result format");
-    return;
+  if (now - ir1RawChangedMs >= IR1_DEBOUNCE_MS &&
+      ir1Blocked != ir1RawBlocked) {
+    ir1Blocked = ir1RawBlocked;
+    Serial.printf("IR1 %s\n", ir1Blocked ? "BLOCKED" : "CLEAR");
   }
-  if (!isSystemRunning || sortingPhase != SortingPhase::WAIT_PI ||
-      requestId != pendingScanId ||
-      millis() - sortingPhaseStarted >= PI_SCAN_TIMEOUT_MS) {
-    Serial.println("PI_IGNORED: stale or unexpected result");
-    return;
-  }
+}
 
-  pendingScanId = 0;
-  currentMango.detected = true;
-  currentMango.type = result == 3   ? MangoType::TOP3
-                      : result == 2 ? MangoType::TOP2
-                                    : MangoType::TOP1;
-  Serial.printf("PI_RESULT: ID=%lu TYPE=%u\n", requestId, result);
-  if (result == 3) {
-    beginGate(SERVO1_CH);
-  } else if (result == 2) {
-    setSortingPhase(SortingPhase::WAIT_IR2);
-    setConveyor(true);
+void updateCameraSequence(uint32_t now) {
+  cameraSorter.tick(now, ir1Blocked, ir2Blocked);
+  // Stop relay before sending either model trigger to Pi.
+  syncSorterOutputs();
+  if (cameraSorter.takeCameraRequest()) {
+    ++cameraScanId;
+    statusDirty = true;
+    sendCameraCommandToPi();
+  }
+  const bool darkRequest = cameraSorter.takeDarkRequest();
+  // Report stable sensor edges once, AFTER applying the motor stop.
+  const bool blockedReported = ir2StatusChanged && ir2Blocked;
+  if (ir2StatusChanged) {
+    Serial.println(ir2Blocked ? "IR2 BLOCKED" : "IR2 CLEAR");
+    ir2StatusChanged = false;
+  }
+  // Re-arm the Pi if START is pressed with a mango already blocking IR2.
+  if (darkRequest && !blockedReported) Serial.println("IR2 BLOCKED");
+}
+
+void updateIr2(uint32_t now) {
+  const bool rawBlocked = digitalRead(IR2_PIN) == IR2_ACTIVE_LEVEL;
+  if (rawBlocked != ir2RawBlocked) {
+    ir2RawBlocked = rawBlocked;
+    ir2RawChangedMs = now;
+  }
+  if (now - ir2RawChangedMs >= IR2_DEBOUNCE_MS &&
+      ir2Blocked != ir2RawBlocked) {
+    ir2Blocked = ir2RawBlocked;
+    ir2StatusChanged = true;
+  }
+}
+
+bool sendStatusToCyd() {
+  hasStatusAttempt = true;
+  lastStatusAttemptMs = millis();
+  cyd::SystemPacket packet =
+      cyd::makeStatus(systemPhase, isSystemRunning);
+  packet.scanId = cameraScanId;
+  // 0=unknown, 1=sweet, 2=sour, 3=external defect.
+  packet.resultType = cameraSorter.result() == 0 ? 3 :
+                      cameraSorter.darkResult() == 0 ? 2 :
+                      cameraSorter.darkResult() == 1 ? 1 : 0;
+  if (!cydLink.send(packet)) return false;
+  lastStatusQueuedMs = millis();
+  statusDirty = false;
+  return true;
+}
+
+// Called by CydLink::poll() in loop(), never in the Wi-Fi callback.
+void onCydPacket(const cyd::SystemPacket &packet, const uint8_t *) {
+  applyRunCommand(packet.isRunning);
+  Serial.printf("CYD_CMD %s\n", packet.isRunning ? "START" : "STOP");
+  sendStatusToCyd();
+}
+
+void printStatus() {
+  Serial.printf("STATUS READY=%u RUNNING=%u PHASE=%u CH=%u ",
+                cydLink.ready(), isSystemRunning, systemPhase, ESPNOW_CHANNEL);
+  Serial.print("MAC=");
+  Serial.print(WiFi.macAddress());
+  Serial.printf(" STATE=%s BELT=%u IR1=%u IR2=%u SERVO_READY=%u CAMERA_RESULT=%d DARK_RESULT=%d",
+                stateName(cameraSorter.state()), beltOutputOn, ir1Blocked,
+                ir2Blocked, servoReady, cameraSorter.result(), cameraSorter.darkResult());
+  Serial.printf(" PEER=%02X:%02X:%02X:%02X:%02X:%02X",
+                CYD_MAC_ADDRESS[0], CYD_MAC_ADDRESS[1], CYD_MAC_ADDRESS[2],
+                CYD_MAC_ADDRESS[3], CYD_MAC_ADDRESS[4], CYD_MAC_ADDRESS[5]);
+  Serial.printf(" TX_OK=%lu TX_FAIL=%lu RX_INVALID=%lu RX_DROP=%lu\n",
+                static_cast<unsigned long>(cydLink.sentOk()),
+                static_cast<unsigned long>(cydLink.sentFailed()),
+                static_cast<unsigned long>(cydLink.invalidReceived()),
+                static_cast<unsigned long>(cydLink.droppedReceived()));
+}
+
+void processUsbCommand(String line) {
+  line.trim();
+  if (line.isEmpty()) return;
+  if (line == "0" || line == "1") {
+    const uint8_t result = static_cast<uint8_t>(line[0] - '0');
+    const bool dark = cameraSorter.state() == CameraSorter::State::WaitingDarkPi;
+    if (cameraSorter.acceptResult(result, millis())) {
+      Serial.printf("%s_RESULT %u %s\n", dark ? "DARK" : "CAMERA", result,
+                    dark ? (result == 0 ? "SOUR" : "SWEET") :
+                           (result == 0 ? "DEFECT" : "PASS"));
+      statusDirty = true;
+    } else {
+      Serial.println("ERR UNEXPECTED_PI_RESULT");
+    }
+    syncSorterOutputs();
+  } else if (line == "STATUS") {
+    printStatus();
+  } else if (line == "SYNC") {
+    statusDirty = true;
+    Serial.println(sendStatusToCyd() ? "QUEUED STATUS" : "ERR SEND_STATUS");
+  } else if (line == "START" || line == "RUN 1" ||
+             line == "STOP" || line == "RUN 0") {
+    applyRunCommand(line == "START" || line == "RUN 1");
+    sendStatusToCyd();
+    printStatus();
   } else {
-    beginRelease(IR1_PIN, false);
+    Serial.println("ERR COMMANDS: STATUS SYNC START STOP RUN_0_1 PI_RESULT_0_1");
   }
 }
-
-void pollPiUart() {
-  // Bound work per loop so incoming UART traffic cannot starve sensor and
-  // timeout checks.
-  for (uint8_t count = 0; count < 64 && PiSerial.available() > 0; ++count) {
-    char c = static_cast<char>(PiSerial.read());
-    if (c == 'P' && piLineLength == 0 && !piLineOverflow) {
-      PiSerial.println("PONG");
-    } else if (c == '\n') {
-      if (!piLineOverflow && piLineLength != 0) {
-        piLine[piLineLength] = '\0';
-        handlePiLine(piLine);
-      }
-      piLineLength = 0;
-      piLineOverflow = false;
-    } else if (c != '\r' && !piLineOverflow) {
-      if (piLineLength < sizeof(piLine) - 1)
-        piLine[piLineLength++] = c;
-      else
-        piLineOverflow = true;
-    }
-  }
-}
-
-void runPiSorting() {
-  pollPiUart();
-  unsigned long now = millis();
-
-  switch (sortingPhase) {
-  case SortingPhase::FAULT:
-    setConveyor(false);
-    break;
-  case SortingPhase::HOMING:
-    setConveyor(false);
-    if (now - sortingPhaseStarted >= SERVO_RETURN_MS) {
-      isSystemRunning = true;
-      currentMango = Mango();
-      setSortingPhase(digitalRead(IR1_PIN) == LOW ? SortingPhase::SCAN_SETTLING
-                                                  : SortingPhase::MOVING);
-      Serial.println("SYSTEM_AUTO_START");
-      PiSerial.println("SYSTEM_AUTO_START");
-    }
-    break;
-  case SortingPhase::MOVING:
-    if (digitalRead(IR1_PIN) == LOW) {
-      setConveyor(false);
-      setSortingPhase(SortingPhase::SCAN_SETTLING);
-    } else {
-      setConveyor(true);
-    }
-    break;
-  case SortingPhase::SCAN_SETTLING:
-    setConveyor(false);
-    if (now - sortingPhaseStarted >= BELT_SETTLE_MS) {
-      if (++scanSequence == 0)
-        ++scanSequence;
-      pendingScanId = scanSequence;
-      setSortingPhase(SortingPhase::WAIT_PI);
-      PiSerial.printf("SCAN,%lu\n", static_cast<unsigned long>(pendingScanId));
-      Serial.printf("PI_SCAN: ID=%lu; conveyor stopped\n",
-                    static_cast<unsigned long>(pendingScanId));
-    }
-    break;
-  case SortingPhase::WAIT_PI:
-    setConveyor(false);
-    if (now - sortingPhaseStarted >= PI_SCAN_TIMEOUT_MS)
-      sortingFault("PI_TIMEOUT");
-    break;
-  case SortingPhase::WAIT_IR2:
-    if (digitalRead(IR2_PIN) == LOW) {
-      setConveyor(false);
-      activeServoChannel = SERVO2_CH;
-      setSortingPhase(SortingPhase::GATE_SETTLING);
-    } else if (now - sortingPhaseStarted >= MANGO_TRAVEL_TIMEOUT_MS) {
-      sortingFault("IR2_TIMEOUT");
-    } else {
-      setConveyor(true);
-    }
-    break;
-  case SortingPhase::GATE_SETTLING:
-    setConveyor(false);
-    if (now - sortingPhaseStarted >= BELT_SETTLE_MS)
-      beginGate(activeServoChannel);
-    break;
-  case SortingPhase::GATING:
-    setConveyor(false);
-    if (now - sortingPhaseStarted >= SERVO_HOLD_MS)
-      beginRelease(activeServoChannel == SERVO1_CH ? IR1_PIN : IR2_PIN, true);
-    break;
-  case SortingPhase::RELEASING:
-    setConveyor(true);
-    if (digitalRead(releaseSensorPin) == LOW) {
-      releaseClearTracking = false;
-    } else if (!releaseClearTracking) {
-      releaseClearTracking = true;
-      releaseClearStarted = now;
-    }
-    if (releaseClearTracking && now - releaseClearStarted >= IR_CLEAR_MS &&
-        (!releaseUsesServo || now - sortingPhaseStarted >= MANGO_DROP_MS)) {
-      if (releaseUsesServo) {
-        setConveyor(false);
-        pwm.writeMicroseconds(activeServoChannel, SERVO_REST_US);
-        setSortingPhase(SortingPhase::RETURNING);
-        Serial.printf("SORT_SERVO: CH%d RETURN\n", activeServoChannel);
-      } else {
-        currentMango = Mango();
-        setSortingPhase(SortingPhase::MOVING);
-      }
-    } else if (now - sortingPhaseStarted >= MANGO_TRAVEL_TIMEOUT_MS) {
-      sortingFault("EXIT_TIMEOUT");
-    }
-    break;
-  case SortingPhase::RETURNING:
-    setConveyor(false);
-    if (now - sortingPhaseStarted >= SERVO_RETURN_MS) {
-      currentMango = Mango();
-      setSortingPhase(SortingPhase::MOVING);
-    }
-    break;
-  }
-
-  static unsigned long lastLog = 0;
-  if (now - lastLog >= 1000) {
-    Serial.printf("SORT_STATUS: FW=AUTO_UART_DIAG1 STATE=%s IR1=%d IR2=%d "
-                  "ENABLED=%d RELAY_CMD=%d\n",
-                  sortingPhaseName(), digitalRead(IR1_PIN),
-                  digitalRead(IR2_PIN), isSystemRunning,
-                  digitalRead(RELAY_PIN));
-    lastLog = now;
-  }
-  delay(5);
-}
+}  // namespace
 
 void setup() {
-  Serial.begin(115200);
-
-  pinMode(IR1_PIN, INPUT);
-  pinMode(IR2_PIN, INPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  pwm.begin();
-  pwm.setPWMFreq(60);
-
-  // Gạt kênh 0 và kênh 1 về 45 độ ngay khi khởi động
-  // setServoAngle(0, 20); // gạt xoài
-  // delay(1000);
-  // setServoAngle(0, 65); // gạt 0
-  // delay(1000);
-  // setServoAngle(0, 20);
-  // delay(1000);
   digitalWrite(RELAY_PIN, RELAY_OFF);
-  if (IR_BELT_TEST_MODE) {
-    Serial.println(
-        "FIRMWARE: IR_STOP_TEST; IR1 G32 + IR2 G33; no Pi, no servo");
-    Serial.println(
-        "TEST_READY: either IR LOW -> STOP; both HIGH -> automatic RUN");
-    runIrBeltStopTest();
-    return;
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+  Serial.begin(115200);
+  Serial.printf("RELAY_INIT PIN=%u OFF_LEVEL=%u ON_LEVEL=%u\n",
+                RELAY_PIN, RELAY_OFF, RELAY_ON);
+  pinMode(IR1_PIN, INPUT_PULLUP);
+  ir1RawBlocked = digitalRead(IR1_PIN) == IR1_ACTIVE_LEVEL;
+  ir1RawChangedMs = millis();
+  pinMode(IR2_PIN, INPUT_PULLUP);
+  ir2RawBlocked = digitalRead(IR2_PIN) == IR2_ACTIVE_LEVEL;
+  ir2RawChangedMs = millis();
+  Wire.begin();  // SDA=21, SCL=22; PCA9685 address 0x40.
+  servoReady = pwm.begin();
+  if (servoReady) {
+    pwm.setOscillatorFrequency(27000000);
+    pwm.setPWMFreq(SERVO_FREQ);
+  } else {
+    cameraSorter.fail(CameraSorter::Fault::ServoMissing, millis());
   }
-
-  PiSerial.begin(PI_UART_BAUD, SERIAL_8N1, PI_UART_RX_PIN, PI_UART_TX_PIN);
-  scanSequence = esp_random();
-  Serial.println(
-      "FIRMWARE: AUTO_UART_DIAG1; automatic startup, no Start button");
-  Serial.printf("BOOT_DIAG: RESET_REASON=%d\n",
-                static_cast<int>(esp_reset_reason()));
-
-  if (SENSOR_STOP_TEST_MODE) {
-    if (!pwm.begin()) {
-      Serial.println("TEST_ERROR: PCA9685 not found; conveyor stays stopped");
-      return;
-    }
-    isSystemRunning = true;
-    Serial.println("TEST_READY: IR1 (GPIO32) and IR2 (GPIO33); automatic mode "
-                   "after servos return");
-    Serial.println(
-        "TEST_SERVOS: IR1 -> CH0, IR2 -> CH1; one cycle per obstacle");
-    Serial.println("TEST_AUTO_RESUME: conveyor restarts when both sensors are "
-                   "clear and servos are home");
-    return;
-  }
-
-  if (!pwm.begin()) {
-    sortingFault("PCA9685_NOT_FOUND");
-    return;
-  }
-  setSortingPhase(SortingPhase::HOMING);
-  Serial.println(
-      "SORT_READY: IR1 scan -> Pi UART; type 3 CH0, type 2 at IR2 CH1");
-  Serial.println(
-      "SORT_READY: automatic start after servos return; one mango at a time");
+  syncSorterOutputs(true);
+  usbLine.reserve(64);
+  const bool ready = cydLink.begin(CYD_MAC_ADDRESS, ESPNOW_CHANNEL, onCydPacket);
+  Serial.println(ready ? "READY CYD_ESPNOW_16_BYTES" : "ERR ESPNOW_INIT");
+  printStatus();
+  if (ready) sendStatusToCyd();
 }
 
 void loop() {
-  if (IR_BELT_TEST_MODE) {
-    runIrBeltStopTest();
-    return;
+  updateIr1(millis());
+  updateIr2(millis());
+  cydLink.poll();
+  // Limit serial processing so a continuous stream cannot starve ESP-NOW.
+  for (uint8_t i = 0; i < 64 && Serial.available(); ++i) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\n') {
+      if (!discardUsbLine) processUsbCommand(usbLine);
+      usbLine = "";
+      discardUsbLine = false;
+    } else if (c != '\r' && !discardUsbLine) {
+      if (usbLine.length() < 64) {
+        usbLine += c;
+      } else {
+        discardUsbLine = true;
+        usbLine = "";
+        Serial.println("ERR LINE_TOO_LONG");
+      }
+    }
   }
-  logSensorChanges();
-  if (SENSOR_STOP_TEST_MODE) {
-    pollPiUart();
-    // runSensorStopTest();
-    return;
-  }
-  runPiSorting();
+
+  const uint32_t now = millis();
+  updateCameraSequence(now);
+  if (cydLink.ready() &&
+      (statusDirty || now - lastStatusQueuedMs >= STATUS_INTERVAL_MS) &&
+      (!hasStatusAttempt || now - lastStatusAttemptMs >= STATUS_RETRY_MS))
+    sendStatusToCyd();
+  delay(1);
 }
